@@ -367,6 +367,7 @@ Examples in situ:
 ### 9. kfuncs
 
 Syntax: KFUNC_PROBE(*function*, typeof(arg1) arg1, typeof(arg2) arge ...)
+        MODULE_KFUNC_PROBE(*module*, *function*, typeof(arg1) arg1, typeof(arg2) arge ...)
 
 This is a macro that instruments the kernel function via trampoline
 *before* the function is executed. It's defined by *function* name and
@@ -388,6 +389,7 @@ Examples in situ:
 ### 10. kretfuncs
 
 Syntax: KRETFUNC_PROBE(*event*, typeof(arg1) arg1, typeof(arg2) arge ..., int ret)
+        MODULE_KRETFUNC_PROBE(*module*, *function*, typeof(arg1) arg1, typeof(arg2) arge ...)
 
 This is a macro that instruments the kernel function via trampoline
 *after* the function is executed. It's defined by *function* name and
@@ -867,6 +869,23 @@ ignores the data associated with the discarded event. Must be preceded by a call
 
 Examples in situ: <!-- TODO -->
 [search /examples](https://github.com/iovisor/bcc/search?q=ringbuf_submit+path%3Aexamples&type=Code),
+
+### 10. ringbuf_query()
+
+Syntax: ```u64 ringbuf_query(u64 flags)```
+
+Return: Requested value, or 0, if flags are not recognized
+
+Flags:
+ - ```BPF_RB_AVAIL_DATA```: Amount of data not yet consumed
+ - ```BPF_RB_RING_SIZE```: The size of ring buffer
+ - ```BPF_RB_CONS_POS```: Consumer position
+ - ```BPF_RB_PROD_POS```: Producer(s) position
+
+A method of the BPF_RINGBUF_OUTPUT table, for getting various properties of ring buffer. Returned values are momentarily snapshots of ring buffer state and could be off by the time helper returns, so this should be used only for debugging/reporting reasons or for implementing various heuristics, that take into account highly-changeable nature of some of those characteristics.
+
+Examples in situ: <!-- TODO -->
+[search /examples](https://github.com/iovisor/bcc/search?q=ringbuf_query+path%3Aexamples&type=Code),
 
 ## Maps
 
@@ -2078,7 +2097,7 @@ These are equivalent.
 
 ### 2. open_perf_buffer()
 
-Syntax: ```table.open_perf_buffers(callback, page_cnt=N, lost_cb=None)```
+Syntax: ```table.open_perf_buffer(callback, page_cnt=N, lost_cb=None)```
 
 This operates on a table as defined in BPF as BPF_PERF_OUTPUT(), and associates the callback Python function ```callback``` to be called when data is available in the perf ring buffer. This is part of the recommended mechanism for transferring per-event data from kernel to user space. The size of the perf ring buffer can be specified via the ```page_cnt``` parameter, which must be a power of two number of pages and defaults to 8. If the callback is not processing data fast enough, some submitted data may be lost. ```lost_cb``` will be called to log / monitor the lost count. If ```lost_cb``` is the default ```None``` value, it will just print a line of message to ```stderr```.
 

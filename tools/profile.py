@@ -25,6 +25,7 @@
 # 15-Jul-2016   Brendan Gregg   Created this.
 # 20-Oct-2016      "      "     Switched to use the new 4.9 support.
 # 26-Jan-2019      "      "     Changed to exclude CPU idle by default.
+# 11-Apr-2023   Rocky Xing      Added option to increase hash storage size.
 
 from __future__ import print_function
 from bcc import BPF, PerfType, PerfSWConfig
@@ -89,9 +90,9 @@ parser = argparse.ArgumentParser(
     epilog=examples)
 thread_group = parser.add_mutually_exclusive_group()
 thread_group.add_argument("-p", "--pid", type=positive_int_list,
-    help="profile process with one or more comma separated PIDs only")
+    help="profile processes with one or more comma-separated PIDs only")
 thread_group.add_argument("-L", "--tid", type=positive_int_list,
-    help="profile thread with one or more comma separated TIDs only")
+    help="profile threads with one or more comma-separated TIDs only")
 # TODO: add options for user/kernel threads only
 stack_group = parser.add_mutually_exclusive_group()
 stack_group.add_argument("-U", "--user-stacks-only", action="store_true",
@@ -111,6 +112,9 @@ parser.add_argument("-I", "--include-idle", action="store_true",
     help="include CPU idle stacks")
 parser.add_argument("-f", "--folded", action="store_true",
     help="output folded format, one line per stack (for flame graphs)")
+parser.add_argument("--hash-storage-size", default=40960,
+    type=positive_nonzero_int,
+    help="the number of hash keys that can be stored and (default %(default)s)")
 parser.add_argument("--stack-storage-size", default=16384,
     type=positive_nonzero_int,
     help="the number of unique stack traces that can be stored and "
@@ -126,6 +130,8 @@ parser.add_argument("--cgroupmap",
     help="trace cgroups in this BPF map only")
 parser.add_argument("--mntnsmap",
     help="trace mount namespaces in this BPF map only")
+parser.add_argument("-A", "--address", action="store_true",
+    help="show raw addresses")
 
 # option logic
 args = parser.parse_args()
@@ -152,15 +158,24 @@ struct key_t {
     int kernel_stack_id;
     char name[TASK_COMM_LEN];
 };
-BPF_HASH(counts, struct key_t);
+BPF_HASH(counts, struct key_t, u64, HASH_STORAGE_SIZE);
 BPF_STACK_TRACE(stack_traces, STACK_STORAGE_SIZE);
 
 // This code gets a bit complex. Probably not suitable for casual hacking.
 
 int do_perf_event(struct bpf_perf_event_data *ctx) {
-    u64 id = bpf_get_current_pid_tgid();
-    u32 tgid = id >> 32;
-    u32 pid = id;
+    u32 tgid = 0;
+    u32 pid = 0;
+
+    struct bpf_pidns_info ns = {};
+    if (USE_PIDNS && !bpf_get_ns_current_pid_tgid(PIDNS_DEV, PIDNS_INO, &ns, sizeof(struct bpf_pidns_info))) {
+        tgid = ns.tgid;
+        pid = ns.pid;
+    } else {
+        u64 id = bpf_get_current_pid_tgid();
+        tgid = id >> 32;
+        pid = id;
+    }
 
     if (IDLE_FILTER)
         return 0;
@@ -212,6 +227,20 @@ int do_perf_event(struct bpf_perf_event_data *ctx) {
 }
 """
 
+# pid-namespace translation
+try:
+    devinfo = os.stat("/proc/self/ns/pid")
+    version = "".join([ver.zfill(2) for ver in os.uname().release.split(".")])
+    # Need Linux >= 5.7 to have helper bpf_get_ns_current_pid_tgid() available:
+    assert(version[:4] >= "0507")
+    bpf_text = bpf_text.replace('USE_PIDNS', "1")
+    bpf_text = bpf_text.replace('PIDNS_DEV', str(devinfo.st_dev))
+    bpf_text = bpf_text.replace('PIDNS_INO', str(devinfo.st_ino))
+except:
+    bpf_text = bpf_text.replace('USE_PIDNS', "0")
+    bpf_text = bpf_text.replace('PIDNS_DEV', "0")
+    bpf_text = bpf_text.replace('PIDNS_INO', "0")
+
 # set idle filter
 idle_filter = "pid == 0"
 if args.include_idle:
@@ -233,6 +262,7 @@ else:
 bpf_text = bpf_text.replace('THREAD_FILTER', thread_filter)
 
 # set stack storage size
+bpf_text = bpf_text.replace('HASH_STORAGE_SIZE', str(args.hash_storage_size))
 bpf_text = bpf_text.replace('STACK_STORAGE_SIZE', str(args.stack_storage_size))
 
 # handle stack args
@@ -313,6 +343,7 @@ def aksym(addr):
 missing_stacks = 0
 has_collision = False
 counts = b.get_table("counts")
+htab_full = args.hash_storage_size == len(counts)
 stack_traces = b.get_table("stack_traces")
 for k, v in sorted(counts.items(), key=lambda counts: counts[1].value):
     # handle get_stackid errors
@@ -364,7 +395,12 @@ for k, v in sorted(counts.items(), key=lambda counts: counts[1].value):
                 print("    [Missed Kernel Stack]")
             else:
                 for addr in kernel_stack:
-                    print("    %s" % aksym(addr).decode('utf-8', 'replace'))
+                    sym_info = b.ksym(addr, True, True).decode('utf-8', 'replace')
+                    if args.address:
+                        print("    0x%-16x %s" % (addr, sym_info))
+                    else:
+                        print("    %s" % sym_info)
+
         if not args.kernel_stacks_only:
             if need_delimiter and k.user_stack_id >= 0 and k.kernel_stack_id >= 0:
                 print("    --")
@@ -372,7 +408,11 @@ for k, v in sorted(counts.items(), key=lambda counts: counts[1].value):
                 print("    [Missed User Stack]")
             else:
                 for addr in user_stack:
-                    print("    %s" % b.sym(addr, k.pid).decode('utf-8', 'replace'))
+                    sym_info = b.sym(addr, k.pid, True, True).decode('utf-8', 'replace')
+                    if args.address:
+                        print("    0x%016x %s" % (addr, sym_info))
+                    else:
+                        print("    %s" % sym_info)
         print("    %-16s %s (%d)" % ("-", k.name.decode('utf-8', 'replace'), k.pid))
         print("        %d\n" % v.value)
 
@@ -382,4 +422,9 @@ if missing_stacks > 0:
         " Consider increasing --stack-storage-size."
     print("WARNING: %d stack traces could not be displayed.%s" %
         (missing_stacks, enomem_str),
+        file=stderr)
+
+# check whether hash table is full
+if htab_full:
+    print("WARNING: hash table full. Consider increasing --hash-storage-size.",
         file=stderr)

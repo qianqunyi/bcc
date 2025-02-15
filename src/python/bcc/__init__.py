@@ -313,6 +313,7 @@ class BPF(object):
         b"__arm64_sys_",
         b"__s390x_sys_",
         b"__s390_sys_",
+        b"__riscv_sys_",
     ]
 
     # BPF timestamps come from the monotonic clock. To be able to filter
@@ -428,6 +429,31 @@ class BPF(object):
         text = _assert_is_bytes(text)
 
         assert not (text and src_file)
+
+        # Fix 'larchintrin.h' file not found error for loongarch64
+        architecture = platform.machine()
+        if architecture == 'loongarch64':
+            # get clang include path
+            try:
+                clang_include_path_output = subprocess.check_output(['clang', '-print-file-name=include'], stderr=subprocess.STDOUT)
+                clang_include_path_str = clang_include_path_output.decode('utf-8').strip('\n')
+                if not os.path.exists(clang_include_path_str):
+                    clang_include_path_str = False
+            except Exception as e:
+                clang_include_path_str = False
+            # get gcc include path
+            try:
+                gcc_include_path_output = subprocess.check_output(['gcc', '-print-file-name=include'], stderr=subprocess.STDOUT)
+                gcc_include_path_str = gcc_include_path_output.decode('utf-8').strip('\n')
+                if not os.path.exists(gcc_include_path_str):
+                    gcc_include_path_str = False
+            except Exception as e:
+                gcc_include_path_str = False
+            # add clang and gcc include path for cflags
+            if clang_include_path_str:
+                cflags.append("-I" + clang_include_path_str)
+            if gcc_include_path_str:
+                cflags.append("-I" + gcc_include_path_str)
 
         self.kprobe_fds = {}
         self.uprobe_fds = {}
@@ -698,6 +724,15 @@ class BPF(object):
                 raise e
             blacklist = set([])
 
+        avail_filter_file = "%s/tracing/available_filter_functions" % DEBUGFS
+        try:
+            with open(avail_filter_file, "rb") as avail_filter_f:
+                avail_filter = set([line.rstrip().split()[0] for line in avail_filter_f])
+        except IOError as e:
+            if e.errno != errno.EPERM:
+                raise e
+            avail_filter = set([])
+
         fns = []
 
         in_init_section = 0
@@ -746,10 +781,11 @@ class BPF(object):
                 elif fn.startswith(b'__SCT__'):
                     continue
                 # Exclude all gcc 8's extra .cold functions
-                elif re.match(b'^.*\.cold(\.\d+)?$', fn):
+                elif re.match(br'^.*\.cold(\.\d+)?$', fn):
                     continue
                 if (t.lower() in [b't', b'w']) and re.fullmatch(event_re, fn) \
-                    and fn not in blacklist:
+                    and fn not in blacklist \
+                    and fn in avail_filter:
                     fns.append(fn)
         return set(fns)     # Some functions may appear more than once
 
@@ -973,9 +1009,23 @@ class BPF(object):
         return module_path, new_addr
 
     @staticmethod
-    def find_library(libname):
+    def find_library(libname, pid=0):
+        """
+        Find the full path to the shared library whose name starts with "lib{libname}".
+
+        If non-zero pid is given, search only the shared libraries mapped by the process with this pid.
+        Otherwise, search the global ldconfig cache at /etc/ld.so.cache.
+
+        Examples:
+            BPF.find_library(b"c", pid=12345)  # returns b"/usr/lib/x86_64-linux-gnu/libc.so.6"
+            BPF.find_library(b"pthread")       # returns b"/lib/x86_64-linux-gnu/libpthread.so.0"
+            BPF.find_library(b"nonexistent")   # returns None
+        """
         libname = _assert_is_bytes(libname)
-        res = lib.bcc_procutils_which_so(libname, 0)
+        if pid:
+            res = lib.bcc_procutils_which_so_in_process(libname, pid)
+        else:
+            res = lib.bcc_procutils_which_so(libname, 0)
         if not res:
             return None
         libpath = ct.cast(res, ct.c_char_p).value
@@ -995,7 +1045,7 @@ class BPF(object):
                 if os.path.isdir(evt_dir):
                     tp = ("%s:%s" % (category, event))
                     if re.match(tp_re.decode(), tp):
-                        results.append(tp)
+                        results.append(tp.encode())
         return results
 
     @staticmethod
